@@ -141,7 +141,7 @@ class UMM(nn.Module):
         self.centers = nn.Parameter(torch.randn(n_components, 2))
 
         # Log of size of the uniform components (n_components x 2 for 2D data)
-        self.log_sizes = nn.Parameter(torch.log(torch.ones(n_components, 2) + torch.rand(n_components, 2)*0.2))
+        self.log_sizes = nn.Parameter(torch.log(3 * torch.ones(n_components, 2) + torch.rand(n_components, 2)*0.2))
 
 
     def forward(self, X):
@@ -154,7 +154,36 @@ class UMM(nn.Module):
             torch.Tensor: Log-likelihood of shape (n_samples,).
         """
         #### YOUR CODE GOES HERE ####
-        
+        # (log pi_k)
+        log_weights = torch.log_softmax(self.weights, dim=0)  # (n_components,)
+
+        # exp(log_sizes)
+        sizes = torch.exp(self.log_sizes)
+
+        # Compute lower and upper bounds for each component
+        lower = self.centers - sizes / 2
+        upper = self.centers + sizes / 2
+
+        # Expand dimensions for broadcasting: (n_samples, 1, 2) vs (1, n_components, 2)
+        X_exp = X.unsqueeze(1)  # (n_samples, 1, 2)
+        lower_exp = lower.unsqueeze(0)  # (1, n_components, 2)
+        upper_exp = upper.unsqueeze(0)  # (1, n_components, 2)
+
+        # Check if samples lie within the bounds for all dimensions
+        within_bounds = (X_exp >= lower_exp) & (X_exp <= upper_exp)
+        within_bounds = within_bounds.all(dim=-1)  # (n_samples, n_components)
+
+        # Compute log p(x | k) = -log(s1) - log(s2) if within bounds, else -1e6
+        sum_log_sizes = self.log_sizes.sum(dim=-1)  # (n_components,)
+        log_pxk = torch.where(
+            within_bounds,
+            -sum_log_sizes,  # -log(s1) - log(s2)
+            torch.tensor(-1e6, device=X.device)
+        )
+
+        log_likelihood = torch.logsumexp(log_weights + log_pxk, dim=1)  # (n_samples,)
+
+        return log_likelihood
     
     
     def loss_function(self, log_likelihood):
@@ -167,7 +196,7 @@ class UMM(nn.Module):
             torch.Tensor: Negative log-likelihood.
         """
         #### YOUR CODE GOES HERE ####
-
+        return -torch.mean(log_likelihood)
 
     def sample(self, n_samples):
         """
@@ -179,6 +208,24 @@ class UMM(nn.Module):
             torch.Tensor: Generated samples of shape (n_samples, 2).
         """
         #### YOUR CODE GOES HERE ####
+        weights = torch.softmax(self.weights, dim=0)
+        indices = torch.multinomial(weights, n_samples, replacement=True)
+
+        samples = []
+        for idx in indices:
+            center = self.centers[idx]
+            size = torch.exp(self.log_sizes[idx])
+
+            # Calculate bounds
+            lower = center - size / 2
+            upper = center + size / 2
+
+            # Use torch.distributions.Uniform
+            uniform_dist = torch.distributions.Uniform(lower, upper)
+            sample = uniform_dist.sample()
+            samples.append(sample)
+
+        return torch.stack(samples).detach()
 
     def conditional_sample(self, n_samples, label):
         """
@@ -191,9 +238,19 @@ class UMM(nn.Module):
             torch.Tensor: Generated samples of shape (n_samples, 2).
         """
         #### YOUR CODE GOES HERE ####
+        center = self.centers[label]
+        size = torch.exp(self.log_sizes[label])
 
+        # Calculate bounds
+        lower = center - (size / 2)
+        upper = center + (size / 2)
 
-def train_model(model, num_epochs, train_loader, test_loader, show_graphs=False, which_epoch=[]):
+        # Use torch.distributions.Uniform
+        uniform_dist = torch.distributions.Uniform(lower, upper)
+        samples = uniform_dist.sample((n_samples,))
+        return samples.detach()
+
+def train_model(model, model_name, num_epochs, train_loader, test_loader, show_graphs=False, which_epoch=[]):
     optimizer = torch.optim.Adam(model.parameters(), lr=GMM_lr)
 
     train_mean_log_likelihoods = []
@@ -235,8 +292,8 @@ def train_model(model, num_epochs, train_loader, test_loader, show_graphs=False,
         if show_graphs:
             if epoch + 1 in which_epoch:
                 samples = model.sample(1000)
-                plot_samples(samples, f"GMM n classes \nepoch: {epoch + 1}")
-                plot_comp_samples(model, f"GMM n classes \n epoch: {epoch + 1}", model.n_components)
+                plot_samples(samples, f"{model_name} n classes \nepoch: {epoch + 1}")
+                plot_comp_samples(model, f"{model_name} n classes \n epoch: {epoch + 1}", model.n_components)
 
     return model, train_mean_log_likelihoods, test_mean_log_likelihoods
 
@@ -280,18 +337,38 @@ def initialize_means(gmm, train_dataset):
     gmm.means.data = torch.stack(means)
     return gmm
 
-def GMM_n_classes(num_epochs, train_loader, test_loader, n_classes, init_means=False):
-    print(f"GMM for {n_classes}")
-    gmm = GMM(n_components=n_classes)
-    title = "GMM n classes"
-    if init_means:
-        gmm = initialize_means(gmm, train_dataset)
-        title = "GMM n class, initialized means"
-    model, train_mean_log_likelihoods, test_mean_log_likelihoods = train_model(gmm, num_epochs, train_loader,
-                                                                               test_loader,
-                                                                               show_graphs=True,
-                                                                               which_epoch=[1, 10, 20, 30, 40, 50])
+def initialize_centers(umm, train_dataset):
+    """
+    Initialize the centers of UMM components using country means, similar to GMM
+    """
+    all_labels = sorted(torch.unique(train_dataset.labels).tolist())
+    centers = []
+    for label in all_labels:
+        label_features = train_dataset.get_features(label)
+        center = torch.mean(label_features, dim=0)
+        centers.append(center)
+    umm.centers.data = torch.stack(centers)
+    return umm
 
+def model_n_classes(model, model_name, num_epochs, train_loader, test_loader, init_means=False):
+    print(f"{model_name} for {model.n_components} components")
+    if model_name == "GMM":
+        title = "GMM n classes"
+    else:
+        title = "UMM n classes"
+
+    if init_means:
+        if model_name == "GMM":
+            model = initialize_means(model, train_dataset)
+        else:
+            model = initialize_centers(umm, train_dataset)
+        title += ", initialized means"
+
+    model, train_mean_log_likelihoods, test_mean_log_likelihoods = train_model(
+        model, model_name, num_epochs, train_loader,
+        test_loader,
+        show_graphs=True,
+        which_epoch=[1, 10, 20, 30, 40, 50])
 
     plt.figure()
     plt.plot(train_mean_log_likelihoods, label='Train Log-Likelihood')
@@ -301,7 +378,6 @@ def GMM_n_classes(num_epochs, train_loader, test_loader, n_classes, init_means=F
     plt.title(title + '\nMean Log-Likelihood vs. Epoch')
     plt.legend()
     plt.show()
-
 
 if __name__ == "__main__":
     
@@ -327,16 +403,37 @@ if __name__ == "__main__":
     #### YOUR CODE GOES HERE ####
 
     n_classes = len(torch.unique(train_dataset.labels))
+
+    # print("\nStarting GMM Experiments...")
+    # for n_comp in [1, 5, 10]:
+    #     print(f"GMM: {n_comp}...")
+    #     gmm = GMM(n_components=n_comp)
+    #     model, _, _ = train_model(gmm, "GMM", num_epochs, train_loader, test_loader)
+    #
+    #     samples = model.sample(1000)
+    #     plot_samples(samples, f"1000 samples from GMM for n_components: {n_comp}")
+    #
+    #     plot_comp_samples(model, f"100 samples from GMM for each component in : {n_comp}", n_comp)
+    #
+    # gmm = GMM(n_components=n_classes)
+    # model_n_classes(gmm, "GMM", num_epochs, train_loader, test_loader)
+    #
+    # gmm = GMM(n_components=n_classes)
+    # model(gmm, "GMM", num_epochs, train_loader, test_loader, init_means=True)
+
+    print("\nStarting UMM Experiments...")
     for n_comp in [1, 5, 10]:
-        print(f"GMM: {n_comp}...")
-        gmm = GMM(n_components=n_comp)
-        model, _, _ = train_model(gmm, num_epochs, train_loader, test_loader)
+        print(f"UMM: {n_comp}...")
+        umm = UMM(n_components=n_comp)
+        model, _, _ = train_model(umm, "UMM", num_epochs, train_loader, test_loader)
 
         samples = model.sample(1000)
-        plot_samples(samples, f"1000 samples from GMM for n_components: {n_comp}")
+        plot_samples(samples, f"1000 samples from UMM for n_components: {n_comp}")
 
-        plot_comp_samples(model, f"100 samples from GMM for each component in : {n_comp}", n_comp)
+        plot_comp_samples(model, f"100 samples from UMM for each component in : {n_comp}", n_comp)
 
-    GMM_n_classes(num_epochs, train_loader, test_loader, n_classes)
+    umm = UMM(n_components=n_classes)
+    model_n_classes(umm, "UMM", num_epochs, train_loader, test_loader)
 
-    GMM_n_classes(num_epochs, train_loader, test_loader, n_classes, init_means=True)
+    umm = UMM(n_components=n_classes)
+    model_n_classes(umm, "UMM", num_epochs, train_loader, test_loader, init_means=True)
